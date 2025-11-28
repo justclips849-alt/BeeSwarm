@@ -157,6 +157,12 @@ local farmStartPollen = 0
 local farmStartHoney = 0
 local statsLastUpdate = 0
 local isStatsPanelEnabled = false
+local isBuffAwareEnabled = false
+local isSproutFarmingEnabled = false
+local sproutFarmState = "FarmingField" -- FarmingField, MovingToSprout, FarmingSprout, CollectingRewards
+local activeSprout = nil
+local savedFieldInfo = nil
+local rewardsCollectionEndTime = 0
 local lastStuckCheckTime = 0
 local lastStuckCheckPosition = nil
 local stuckCounter = 0
@@ -534,7 +540,14 @@ local function computeCandidateScore(baseWeight, travelDist, spawnTime, now, tra
     -- More points for older tokens that are about to despawn.
     local ageBonus = math.min(age * 3, 25)
     -- Bonus for transparency, also indicating it is about to despawn.
-    local transparencyBonus = (transparency or 0) ^ 2 * 30
+    local transparency = transparency or 0
+    local transparencyBonus = transparency ^ 2 * 40 -- Slightly increased base bonus
+    
+    -- Add a large "emergency" bonus for tokens that are critically close to despawning.
+    if transparency > 0.85 then
+        transparencyBonus = transparencyBonus + 50
+    end
+
     -- Distance penalty is more significant for further tokens.
     local distancePenalty = travelDist / 3.5
     local score = baseWeight + ageBonus + transparencyBonus - distancePenalty
@@ -2217,19 +2230,43 @@ isAutoDispenseEnabled = state and true or false
 end
 })
 AutoFarmSection:CreateToggle({
-Title = "Stats Panel",
-Default = false,
-SaveKey = "farm_stats_panel",
-Callback = function(state)
-isStatsPanelEnabled = state
-if state then
-createStatsPanel()
-else
-destroyStatsPanel()
-end
-end
+    Title = "Stats Panel",
+    Default = false,
+    SaveKey = "farm_stats_panel",
+    Callback = function(state)
+        isStatsPanelEnabled = state
+        if state then
+            createStatsPanel()
+        else
+            destroyStatsPanel()
+        end
+    end
 })
-local function rebuildFieldRouteLabel()
+AutoFarmSection:CreateToggle({
+    Title = "Buff-Aware Farming",
+    Default = false,
+    SaveKey = "farm_buff_aware_enabled",
+    HelpText = "EXPERIMENTAL: Prioritizes tokens for buffs you don't have. May slightly reduce overall token speed for better buff uptime.",
+        Callback = function(state)
+            isBuffAwareEnabled = state
+        end
+    })
+    AutoFarmSection:CreateToggle({
+        Title = "Sprout Farming",
+        Default = false,
+        SaveKey = "farm_sprout_farming_enabled",
+        HelpText = "When enabled with Auto Farm, automatically moves to farm sprouts when they appear.",
+        Callback = function(state)
+            isSproutFarmingEnabled = state
+            if not state then
+                -- Reset state if disabled
+                sproutFarmState = "FarmingField"
+                activeSprout = nil
+                savedFieldInfo = nil
+            end
+        end
+    })
+    local function rebuildFieldRouteLabel()
 if not fieldRouteDisplay then return end
 if #fieldRoute == 0 then
 fieldRouteDisplay.SetText("No steps queued")
@@ -2790,433 +2827,561 @@ Icon = "rbxassetid://133154037851337",
 HelpText = "Quality-of-life helpers that keep the session active."
 })
 UtilitySection:CreateToggle({
-Title = "Anti AFK",
-Default = false,
-SaveKey = "misc_anti_afk",
-Callback = function(state)
-setAntiAfk(state)
-end
+	Title = "Anti AFK",
+	Default = false,
+	SaveKey = "misc_anti_afk",
+	Callback = function(state)
+		setAntiAfk(state)
+	end,
 })
 uiObjects.autoClaimHiveToggle = UtilitySection:CreateToggle({
-Title = "Auto Claim Hive",
-Default = false,
-SaveKey = "misc_auto_claim_hive",
-Callback = function(state)
-isAutoClaimHiveEnabled = state
-if state then
-doAutoClaimHive()
-end
-end
+	Title = "Auto Claim Hive",
+	Default = false,
+	SaveKey = "misc_auto_claim_hive",
+	Callback = function(state)
+		isAutoClaimHiveEnabled = state
+		if state then
+			doAutoClaimHive()
+		end
+	end,
 })
 
--- Buff-aware farming logic
-local activeBuffs = {}
-local lastBuffScanTime = 0
-local BUFF_SCAN_INTERVAL = 5 -- seconds
-local buffModulesLoaded = false
-local OsTime, BuffsModule, Events -- modules
+local buffLogicState = {}
 
-local function loadBuffModules()
-    if buffModulesLoaded then return true end
+local function findBestSprout()
+	if not isSproutFarmingEnabled then
+		return nil, nil
+	end
+	local sproutsFolder = Workspace:FindFirstChild("Sprouts")
+	if not sproutsFolder then
+		return nil, nil
+	end
 
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    if not ReplicatedStorage then
-        warn("Buff-aware farming disabled: ReplicatedStorage service not available.")
-        return false
-    end
+	local bestSprout = nil
+	local minDistance = math.huge
+	local rootPart = getHRP()
+	if not rootPart then
+		return nil, nil
+	end
+	local rootPosition = rootPart.Position
 
-    -- Use pcall for each require and WaitForChild for safety.
-    local ok_os, res_os = pcall(require, ReplicatedStorage:WaitForChild("OsTime", 1))
-    local ok_buffs, res_buffs = pcall(require, ReplicatedStorage:WaitForChild("Buffs", 1))
-    local ok_events, res_events = pcall(require, ReplicatedStorage:WaitForChild("Events", 1))
-
-    if ok_os and ok_buffs and ok_events and res_os and res_buffs and res_events then
-        OsTime = res_os
-        BuffsModule = res_buffs
-        Events = res_events
-        buffModulesLoaded = true
-        return true
-    end
-    
-    warn("Buff-aware farming disabled: Could not load one or more required modules (OsTime, Buffs, or Events). They may not exist.")
-    -- Disable for a while to avoid spamming warnings
-    lastBuffScanTime = tick() + 60 
-    return false
+	for _, sprout_item in ipairs(sproutsFolder:GetChildren()) do
+		if sprout_item.Name == "Sprout" then
+			local sproutPart = sprout_item:IsA("Model") and sprout_item.PrimaryPart or (sprout_item:IsA("BasePart") and sprout_item or nil)
+			if sproutPart then
+				local distance = (rootPosition - sproutPart.Position).Magnitude
+				if distance < minDistance then
+					minDistance = distance
+					bestSprout = sproutPart
+				end
+			end
+		end
+	end
+	return bestSprout, minDistance
 end
 
--- This function updates the shared 'activeBuffs' table.
-local function scanForPlayerBuffs(stats, now)
-    -- Clear old buffs before scan
-    for k in pairs(activeBuffs) do
-        activeBuffs[k] = nil
-    end
-
-    if not stats or not stats.Modifiers then return end
-
-    for statName, variants in pairs(stats.Modifiers) do
-        for paramTag, data in pairs(variants) do
-            if data.Mods then
-                for _, mod in ipairs(data.Mods) do
-                    if mod.Src then
-                        local buffName = mod.Src
-                        local buffDef = BuffsModule.Get(buffName)
-                        
-                        if buffDef then
-                            local duration = mod.Dur or buffDef.Dur
-                            if duration then
-                                local startTime = mod.Start
-                                local timeLeft = duration
-                                if startTime and now then
-                                    local elapsed = now - startTime
-                                    timeLeft = duration - elapsed
-                                end
-                                
-                                if timeLeft > 0 then
-                                    activeBuffs[buffName] = { Stacks = mod.Combo or 1, TimeLeft = timeLeft }
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function getDynamicTokenWeight(tokenName)
-    local baseWeight = getTokenPriorityScore(tokenName)
-    if not buffModulesLoaded then return baseWeight end
-
-    if FARM_PRIORITY_ITEMS[tokenName] then
-        return baseWeight * 1.1 -- Slight boost for critical items
-    end
-
-    if activeBuffs[tokenName] then
-        return baseWeight * 0.25 -- Already have it, lower priority
-    end
-
-    return baseWeight * 1.5 -- Don't have it, boost priority
-end
 RunService.Stepped:Connect(function()
-local char = LocalPlayer.Character
-if not char or not char:FindFirstChild("Humanoid") then return end
-local humanoid = char.Humanoid
-local rootPart = char.HumanoidRootPart
+	local char = LocalPlayer.Character
+	if not char or not char:FindFirstChild("Humanoid") then
+		return
+	end
+	local humanoid = char.Humanoid
+	local rootPart = char.HumanoidRootPart
 
-local now = tick()
-local currentTargetPosition = nil
-local candidates = candidateBuffer
-if isSpeedEnabled and not isDispensing then humanoid.WalkSpeed = currentSpeed end
-if isJumpEnabled and not isDispensing then humanoid.JumpPower = currentJump end
-if isNoclipEnabled then
-    humanoid:ChangeState(Enum.HumanoidStateType.Running)
-    for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
-    end
-end
-if not isAutoFarmEnabled or isDispensing then
-    for i = 1, #pathParts do
-        pathParts[i].Transparency = 1
-    end
-    return
-end
+	local now = tick()
+	local currentTargetPosition = nil
+	local candidates = candidateBuffer
+	if isSpeedEnabled and not isDispensing then
+		humanoid.WalkSpeed = currentSpeed
+	end
+	if isJumpEnabled and not isDispensing then
+		humanoid.JumpPower = currentJump
+	end
+	if isNoclipEnabled then
+		humanoid:ChangeState(Enum.HumanoidStateType.Running)
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				part.CanCollide = false
+			end
+		end
+	end
 
--- Buff-aware farming: periodically scan buffs
-if now - lastBuffScanTime > BUFF_SCAN_INTERVAL then
-    if loadBuffModules() then
-        task.spawn(function()
-            local success, stats = pcall(Events.ClientCall, "RetrievePlayerStats")
-            if success and stats then
-                -- Pass the timestamp from OsTime() for accurate calculations
-                scanForPlayerBuffs(stats, OsTime())
-            elseif not success then
-                warn("BuffScan: Error calling RetrievePlayerStats: " .. tostring(stats))
-            end
-        end)
-    end
-    lastBuffScanTime = now
-end
--- Simplified stuck logic: if wandering and not moving, find a new spot.
-if not activeToken and wanderTarget and now - lastMoveCommandTime > 4 then
-    wanderTarget = chooseWanderSpot(rootPart.Position, now)
-    if wanderTarget then
-        wanderExpireTime = now + 2.75
-        requestMoveTo(wanderTarget, true) -- Force move
-    end
-end
-local coreStats = LocalPlayer:FindFirstChild("CoreStats")
-local pollen = coreStats and coreStats:FindFirstChild("Pollen")
-local capacity = coreStats and coreStats:FindFirstChild("Capacity")
-local honey = coreStats and coreStats:FindFirstChild("Honey")
-if coreStats and farmSessionStart > 0 then
-    if now - statsLastUpdate > 0.5 then
-        statsLastUpdate = now
-        local currentPollen = pollen and pollen.Value or 0
-        local currentHoney = honey and honey.Value or 0
-        local elapsed = math.max(now - farmSessionStart, 1)
-        local pollenGained = currentPollen - farmStartPollen
-        local honeyGained = currentHoney - farmStartHoney
-        local pollenPerMin = (pollenGained / elapsed) * 60
-        local honeyPerHour = (honeyGained / elapsed) * 3600
-        local capValue = capacity and capacity.Value or 0
-        local percent = (capValue > 0) and (currentPollen / capValue * 100) or 0
-        local minutes = math.floor(elapsed / 60)
-        local seconds = math.floor(elapsed % 60)
-        if isStatsPanelEnabled and statsLabel then
-            local statsText = string.format(
-                "Session: %02d:%02d\nPollen: %s / %s (%.1f%%%%)\nPollen Gain: %s (%s/min)\nHoney Gain: %s (%s/hr)",
-                minutes, seconds,
-                formatShort(currentPollen), formatShort(capValue), percent,
-                formatShort(pollenGained), formatShort(pollenPerMin),
-                formatShort(honeyGained), formatShort(honeyPerHour)
-            )
-            statsLabel.Text = statsText
-        end
-    end
-end
-if isAutoDispenseEnabled and pollen and capacity and pollen.Value >= capacity.Value then
-    task.spawn(dispenseHoney)
-    return
-end
-if not selectedField then return end
-humanoid.WalkSpeed = 90
-if not isInField(rootPart.Position) then
-    if not char.PrimaryPart then
-        char.PrimaryPart = rootPart
-    end
-    char:SetPrimaryPartCFrame(selectedField.CFrame + Vector3.new(0, 5, 0))
-end
-local collectibles = Workspace:FindFirstChild("Collectibles")
-if not collectibles then return end
-decayFieldHeat(now)
-cleanupTokenCaches(now)
-local function requestMoveTo(targetPos, force)
-    if not targetPos then
-        return
-    end
-    local delta = lastMoveCommandPos and (targetPos - lastMoveCommandPos).Magnitude or math.huge
-    local shouldMove = force or not lastMoveCommandPos or delta > MOVE_COMMAND_EPS
-    if not shouldMove then
-        local elapsed = now - lastMoveCommandTime
-        if elapsed > MOVE_COMMAND_RETRY then
-            shouldMove = true
-        end
-    end
-    if shouldMove then
-        humanoid:MoveTo(targetPos)
-        lastMoveCommandPos = targetPos
-        lastMoveCommandTime = now
-    end
-end
-local function releaseActiveToken()
-    if activeToken then
-        local info = tokenMetadata[activeToken]
-        if info and info.LastPos then
-            addHeatSample(info.LastPos, 0.5)
-        end
-        if activeTokenIsLink then
-            resetTable(visitedTokens)
-            resetTable(tokenMetadata)
-        else
-            visitedTokens[activeToken] = now + TOKEN_RECENT_DELAY
-        end
-        activeToken = nil
-        activeTokenIsLink = false
-        activeTokenScore = 0
-    end
-    wanderTarget = nil
-    wanderExpireTime = 0
-    wanderLastBase = nil
-    currentTargetPosition = nil
-    resetMoveCommand()
-end
-local function lockActiveCandidate(candidate, forceIsLink)
-    if not candidate or not candidate.Part then
-        return
-    end
-    activeToken = candidate.Part
-    activeTokenIsLink = forceIsLink and true
-        or (candidate.TokenName and string.find(candidate.TokenName, "Token Link") ~= nil)
-    wanderTarget = nil
-    wanderExpireTime = 0
-    local targetPos = candidate.Pos
-    currentTargetPosition = targetPos
-    requestMoveTo(targetPos, true)
-    local info = getTokenInfo(activeToken)
-    if info then
-        info.TargetedAt = now
-        info.LastScore = candidate.Score or candidate.BaseWeight or 0
-        info.TokenName = candidate.TokenName
-        activeTokenScore = info.LastScore or 0
-    else
-        activeTokenScore = candidate.Score or candidate.BaseWeight or 0
-    end
-end
-if activeToken then
-    local tokenPos
-    if activeToken.Parent then
-        tokenPos = activeToken:GetPivot().Position
-        updateTokenTracking(activeToken, tokenPos, now)
-    end
-    local info = tokenMetadata[activeToken]
-    if not tokenPos or activeToken.Transparency >= 0.9 then
-        releaseActiveToken()
-    elseif not isInField(tokenPos) then
-        releaseActiveToken()
-    else
-        local predicted = predictTokenPosition(info, rootPart.Position, humanoid.WalkSpeed)
-        local targetPos = predicted or tokenPos
-        local tokenDist = (rootPart.Position - targetPos).Magnitude
-        local rawDist = info and info.LastPos and (rootPart.Position - info.LastPos).Magnitude or tokenDist
-        local targetedAt = info and info.TargetedAt or now
-        local chaseTime = now - targetedAt
-        local closeEnough = tokenDist <= TOKEN_PASS_RADIUS
-            or rawDist <= (TOKEN_PASS_RADIUS + 1.5)
-            or (chaseTime > 0.35 and tokenDist <= TOKEN_PASS_RADIUS * 1.75)
-            or chaseTime > 0.9
-        if closeEnough then
-            releaseActiveToken()
-        else
-            requestMoveTo(targetPos)
-            currentTargetPosition = targetPos
-        end
-    end
-end
-resetTable(candidates)
-for _, part in ipairs(collectibles:GetChildren()) do
-    local recentlyVisited = visitedTokens[part] and visitedTokens[part] > now
-    if not recentlyVisited and part.Name == "C" and part.Transparency < 0.9 and part ~= activeToken then
-        local pos = part:GetPivot().Position
-        if isInField(pos) and (pos.Y - rootPart.Position.Y) < 3 then
-            local dist = (rootPart.Position - pos).Magnitude
-            if dist < MAX_TOKEN_TRACK_DISTANCE then
-                local info = updateTokenTracking(part, pos, now)
-                if info then
-                    local decal = part:FindFirstChildOfClass("Decal")
-                    local id = decal and getCleanID(decal.Texture)
-                    local name = id and (FARM_DATABASE[tostring(id)] or FARM_DATABASE[tostring(id - 1)] or FARM_DATABASE[tostring(id + 1)]) or "Unknown"
-                    local predicted = predictTokenPosition(info, rootPart.Position, humanoid.WalkSpeed)
-                    if predicted then
-                        addHeatSample(predicted, 0.05)
-                    end
-                    local targetPos = predicted or pos
-                    local travelDist = (rootPart.Position - targetPos).Magnitude
-                    local weight = getDynamicTokenWeight(name) -- Changed from getTokenPriorityScore for buff awareness
-                    local score = computeCandidateScore(weight, travelDist, info.SpawnTime or now, now, part.Transparency)
-                    addHeatSample(pos, 0.1)
-                    table.insert(candidates, {
-                        Part = part,
-                        Pos = targetPos,
-                        RawPos = pos,
-                        Dist = travelDist,
-                        SpawnTime = info.SpawnTime or now,
-                        IsPriority = FARM_PRIORITY_ITEMS[name] == true,
-                        TokenName = name,
-                        BaseWeight = weight,
-                        Score = score,
-                    })
-                end
-            end
-        end
-    end
-end
--- Boost scores based on token density to favor clusters
-for i, c1 in ipairs(candidates) do
-    local clusterBonus = 0
-    for j, c2 in ipairs(candidates) do
-        if i ~= j then
-            local dist = (c1.RawPos - c2.RawPos).Magnitude
-            local radius = 45 -- Studs
-            if dist < radius then
-                -- Bonus is proportional to neighbor's base value and proximity
-                local proximityFactor = (1 - (dist / radius))^2 -- squared for stronger falloff
-                clusterBonus = clusterBonus + (c2.BaseWeight or 0) * proximityFactor * 0.45 -- 45% cluster effect
-            end
-        end
-    end
-    c1.Score = (c1.Score or 0) + clusterBonus
-end
+	if not isAutoFarmEnabled or isDispensing then
+		for i = 1, #pathParts do
+			pathParts[i].Transparency = 1
+		end
+		return
+	end
 
-table.sort(candidates, function(a, b)
-    -- Primarily sort by score
-    if math.abs((a.Score or 0) - (b.Score or 0)) > 0.1 then
-        return (a.Score or 0) > (b.Score or 0)
-    end
-    -- As a final tie-breaker, take the closer one
-    return a.Dist < b.Dist
-end)
-local topCandidate = candidates[1]
-if activeToken and not activeTokenIsLink and topCandidate and activeToken ~= topCandidate.Part then
-    local info = tokenMetadata[activeToken]
-    local currentScore = (info and info.LastScore) or activeTokenScore or 0
-    local bestScore = topCandidate.Score or topCandidate.BaseWeight or 0
-    if bestScore - currentScore >= SCORE_RELOCK_THRESHOLD then
-        releaseActiveToken()
-        lockActiveCandidate(topCandidate)
-    end
-end
-if not activeToken then
-    if topCandidate then
-        lockActiveCandidate(topCandidate)
-    else
-        if (not wanderTarget) or (rootPart.Position - wanderTarget).Magnitude < 10 or now > wanderExpireTime then
-            wanderTarget = chooseWanderSpot(rootPart.Position, now)
-            if wanderTarget then
-                wanderExpireTime = now + 2.75
-            end
-        end
-        if not wanderTarget then
-            wanderTarget = rootPart.Position + Vector3.new(math.random(-8, 8), 0, math.random(-8, 8))
-            wanderExpireTime = now + 1.5
-        end
-        requestMoveTo(wanderTarget)
-        currentTargetPosition = wanderTarget
-    end
-elseif not currentTargetPosition then
-    local info = tokenMetadata[activeToken]
-    if info and info.LastPos then
-        currentTargetPosition = predictTokenPosition(info, rootPart.Position, humanoid.WalkSpeed) or info.LastPos
-    end
-end
-local pathPoints = {}
-table.insert(pathPoints, rootPart.Position)
-if currentTargetPosition then
-    table.insert(pathPoints, currentTargetPosition)
-end
-local lastPoint = pathPoints[#pathPoints]
-if #candidates > 0 and lastPoint then
-    local maxExtra = MAX_PATH_SEGMENTS - 1
-    for i = 1, math.min(#candidates, maxExtra) do
-        local pos = candidates[i].Pos
-        if (pos - lastPoint).Magnitude > 1 then
-            table.insert(pathPoints, pos)
-            lastPoint = pos
-        end
-    end
-end
-local segmentCount = #pathPoints - 1
-for i = 1, #pathParts do
-    local part = pathParts[i]
-    if i <= segmentCount then
-        local startPos = pathPoints[i]
-        local endPos = pathPoints[i + 1]
-        local direction = endPos - startPos
-        local distance = direction.Magnitude
-        if distance > 1 then
-            part.Transparency = 0.25
-            part.Size = Vector3.new(0.15, 0.15, distance)
-            part.CFrame = CFrame.new(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
-        else
-            part.Transparency = 1
-        end
-    else
-        part.Transparency = 1
-    end
-end
+	-- Stuck/Reset logic
+	if (sproutFarmState == "FarmingField" and not activeToken and wanderTarget and now - lastMoveCommandTime > 4) or (sproutFarmState == "MovingToSprout" and now - lastMoveCommandTime > 8) then
+		if sproutFarmState == "MovingToSprout" then
+			-- If stuck while moving to sprout, reset state and go back to field
+			sproutFarmState = "FarmingField"
+			if savedFieldInfo then
+				uiObjects.farmFieldDropdown:SetSelection(savedFieldInfo.Name)
+			end
+			savedFieldInfo = nil
+			activeSprout = nil
+		else
+			wanderTarget = chooseWanderSpot(rootPart.Position, now)
+			if wanderTarget then
+				wanderExpireTime = now + 2.75
+				requestMoveTo(wanderTarget, true) -- Force move
+			end
+		end
+	end
+
+	local coreStats = LocalPlayer:FindFirstChild("CoreStats")
+	local pollen = coreStats and coreStats:FindFirstChild("Pollen")
+	local capacity = coreStats and coreStats:FindFirstChild("Capacity")
+	local honey = coreStats and coreStats:FindFirstChild("Honey")
+
+	if coreStats and farmSessionStart > 0 then
+		if now - statsLastUpdate > 0.5 then
+			statsLastUpdate = now
+			local currentPollen = pollen and pollen.Value or 0
+			local currentHoney = honey and honey.Value or 0
+			local elapsed = math.max(now - farmSessionStart, 1)
+			local pollenGained = currentPollen - farmStartPollen
+			local honeyGained = currentHoney - farmStartHoney
+			local pollenPerMin = (pollenGained / elapsed) * 60
+			local honeyPerHour = (honeyGained / elapsed) * 3600
+			local capValue = capacity and capacity.Value or 0
+			local percent = (capValue > 0) and (currentPollen / capValue * 100) or 0
+			local minutes = math.floor(elapsed / 60)
+			local seconds = math.floor(elapsed % 60)
+			if isStatsPanelEnabled and statsLabel then
+				local statsText = string.format("Session: %02d:%02d\nPollen: %s / %s (%.1f%%%%)\nPollen Gain: %s (%s/min)\nHoney Gain: %s (%s/hr)", minutes, seconds, formatShort(currentPollen), formatShort(capValue), percent, formatShort(pollenGained), formatShort(pollenPerMin), formatShort(honeyGained), formatShort(honeyPerHour))
+				statsLabel.Text = statsText
+			end
+		end
+	end
+
+	if isAutoDispenseEnabled and pollen and capacity and pollen.Value >= capacity.Value then
+		task.spawn(dispenseHoney)
+		return
+	end
+
+	-- Ensure player is in a field, but only teleport if not handling sprouts
+	if sproutFarmState == "FarmingField" and not isInField(rootPart.Position) then
+		if selectedField then
+			if not char.PrimaryPart then
+				char.PrimaryPart = rootPart
+			end
+			char:SetPrimaryPartCFrame(selectedField.CFrame + Vector3.new(0, 5, 0))
+		else
+			return -- No field selected, do nothing
+		end
+	end
+
+	local function requestMoveTo(targetPos, force)
+		if not targetPos then
+			return
+		end
+		local delta = lastMoveCommandPos and (targetPos - lastMoveCommandPos).Magnitude or math.huge
+		local shouldMove = force or not lastMoveCommandPos or delta > MOVE_COMMAND_EPS
+		if not shouldMove then
+			local elapsed = now - lastMoveCommandTime
+			if elapsed > MOVE_COMMAND_RETRY then
+				shouldMove = true
+			end
+		end
+		if shouldMove then
+			humanoid:MoveTo(targetPos)
+			lastMoveCommandPos = targetPos
+			lastMoveCommandTime = now
+		end
+	end
+
+	-- SPROUT FARMING STATE MACHINE
+	if isSproutFarmingEnabled then
+		if sproutFarmState == "FarmingField" then
+			local foundSprout, sproutDist = findBestSprout()
+			if foundSprout then
+				notify("Sprout Farm", "Sprout detected! Moving to farm.", 3)
+				savedFieldInfo = { Name = selectedFieldName, Object = selectedField }
+				activeSprout = foundSprout
+				sproutFarmState = "MovingToSprout"
+				return -- Skip the rest of the farm logic for this frame
+			end
+		elseif sproutFarmState == "MovingToSprout" then
+			if not activeSprout or not activeSprout.Parent then
+				notify("Sprout Farm", "Sprout destroyed or gone. Resuming farming.", 3)
+				sproutFarmState = "FarmingField"
+				if savedFieldInfo and savedFieldInfo.Name then
+					uiObjects.farmFieldDropdown:SetSelection(savedFieldInfo.Name)
+				end
+				activeSprout = nil
+				savedFieldInfo = nil
+				return
+			end
+			local sproutPosition = activeSprout.Position
+			local distanceToSprout = (rootPart.Position - sproutPosition).Magnitude
+			if distanceToSprout < 20 then
+				notify("Sprout Farm", "Arrived at sprout. Farming...", 2)
+				sproutFarmState = "FarmingSprout"
+			else
+				requestMoveTo(sproutPosition, true)
+			end
+			-- Bypass normal token/wander logic while moving
+			return
+		elseif sproutFarmState == "FarmingSprout" then
+			if not activeSprout or not activeSprout.Parent then
+				notify("Sprout Farm", "Sprout destroyed! Collecting rewards for 15s.", 3)
+				sproutFarmState = "CollectingRewards"
+				rewardsCollectionEndTime = now + 15
+				wanderLastBase = activeSprout.Position -- Set collection area center
+				activeSprout = nil
+			else
+				-- Keep player near the sprout
+				wanderTarget = activeSprout.Position
+				requestMoveTo(wanderTarget)
+			end
+		elseif sproutFarmState == "CollectingRewards" then
+			if now > rewardsCollectionEndTime then
+				notify("Sprout Farm", "Reward collection finished. Returning to field.", 3)
+				sproutFarmState = "FarmingField"
+				if savedFieldInfo and savedFieldInfo.Name then
+					uiObjects.farmFieldDropdown:SetSelection(savedFieldInfo.Name)
+				end
+				savedFieldInfo = nil
+				wanderLastBase = nil
+				return
+			else
+				-- Wander around the last sprout position to collect tokens
+				if (not wanderTarget) or (rootPart.Position - wanderTarget).Magnitude < 10 or now > wanderExpireTime then
+					wanderTarget = chooseWanderSpot(wanderLastBase or rootPart.Position, now)
+					if wanderTarget then
+						wanderExpireTime = now + 1.5
+					end
+				end
+				requestMoveTo(wanderTarget)
+			end
+		end
+	end
+
+	-- Standard Farming Logic (only runs if not moving to sprout)
+	if sproutFarmState ~= "MovingToSprout" then
+		humanoid.WalkSpeed = 90
+		if sproutFarmState == "FarmingField" and not selectedField then
+			return
+		end
+		if sproutFarmState == "FarmingField" then
+			decayFieldHeat(now)
+		end
+		cleanupTokenCaches(now)
+
+		local function releaseActiveToken()
+			if activeToken then
+				local info = tokenMetadata[activeToken]
+				if info and info.LastPos then
+					addHeatSample(info.LastPos, 0.5)
+				end
+				if activeTokenIsLink then
+					resetTable(visitedTokens)
+					resetTable(tokenMetadata)
+				else
+					visitedTokens[activeToken] = now + TOKEN_RECENT_DELAY
+				end
+				activeToken = nil
+				activeTokenIsLink = false
+				activeTokenScore = 0
+			end
+			wanderTarget = nil
+			wanderExpireTime = 0
+			if sproutFarmState ~= "FarmingSprout" and sproutFarmState ~= "CollectingRewards" then
+				wanderLastBase = nil
+			end
+			currentTargetPosition = nil
+			resetMoveCommand()
+		end
+
+		local function lockActiveCandidate(candidate, forceIsLink)
+			if not candidate or not candidate.Part then
+				return
+			end
+			activeToken = candidate.Part
+			activeTokenIsLink = forceIsLink and true or (candidate.TokenName and string.find(candidate.TokenName, "Token Link") ~= nil)
+			wanderTarget = nil
+			wanderExpireTime = 0
+			local targetPos = candidate.Pos
+			currentTargetPosition = targetPos
+			requestMoveTo(targetPos, true)
+			local info = getTokenInfo(activeToken)
+			if info then
+				info.TargetedAt = now
+				info.LastScore = candidate.Score or candidate.BaseWeight or 0
+				info.TokenName = candidate.TokenName
+				activeTokenScore = info.LastScore or 0
+			else
+				activeTokenScore = candidate.Score or candidate.BaseWeight or 0
+			end
+		end
+
+		if activeToken then
+			local tokenPos
+			if activeToken.Parent then
+				tokenPos = activeToken:GetPivot().Position
+				updateTokenTracking(activeToken, tokenPos, now)
+			end
+			local info = tokenMetadata[activeToken]
+			if not tokenPos or activeToken.Transparency >= 0.9 then
+				releaseActiveToken()
+			elseif sproutFarmState == "FarmingField" and not isInField(tokenPos) then
+				releaseActiveToken()
+			else
+				local predicted = predictTokenPosition(info, rootPart.Position, humanoid.WalkSpeed)
+				local targetPos = predicted or tokenPos
+				local tokenDist = (rootPart.Position - targetPos).Magnitude
+				local rawDist = info and info.LastPos and (rootPart.Position - info.LastPos).Magnitude or tokenDist
+				local targetedAt = info and info.TargetedAt or now
+				local chaseTime = now - targetedAt
+				local closeEnough = tokenDist <= TOKEN_PASS_RADIUS or rawDist <= (TOKEN_PASS_RADIUS + 1.5) or (chaseTime > 0.35 and tokenDist <= TOKEN_PASS_RADIUS * 1.75) or chaseTime > 0.9
+				if closeEnough then
+					releaseActiveToken()
+				else
+					requestMoveTo(targetPos)
+					currentTargetPosition = targetPos
+				end
+			end
+		end
+
+		resetTable(candidates)
+		local collectibles = Workspace:FindFirstChild("Collectibles")
+		if collectibles then
+			for _, part in ipairs(collectibles:GetChildren()) do
+				local recentlyVisited = visitedTokens[part] and visitedTokens[part] > now
+				if not recentlyVisited and part.Name == "C" and part.Transparency < 0.9 and part ~= activeToken then
+					local pos = part:GetPivot().Position
+					local shouldProcess = false
+					if sproutFarmState == "FarmingField" then
+						if isInField(pos) and (pos.Y - rootPart.Position.Y) < 3 then
+							shouldProcess = true
+						end
+					else -- For sprout farming/collecting, check distance from player instead of field
+						if (pos - rootPart.Position).Magnitude < 150 then
+							shouldProcess = true
+						end
+					end
+
+					if shouldProcess then
+						local dist = (rootPart.Position - pos).Magnitude
+						if dist < MAX_TOKEN_TRACK_DISTANCE then
+							local info = updateTokenTracking(part, pos, now)
+							if info then
+								local decal = part:FindFirstChildOfClass("Decal")
+								local id = decal and getCleanID(decal.Texture)
+								local name = id and (FARM_DATABASE[tostring(id)] or FARM_DATABASE[tostring(id - 1)] or FARM_DATABASE[tostring(id + 1)]) or "Unknown"
+								local predicted = predictTokenPosition(info, rootPart.Position, humanoid.WalkSpeed)
+								if predicted then
+									addHeatSample(predicted, 0.05)
+								end
+								local targetPos = predicted or pos
+								local travelDist = (rootPart.Position - targetPos).Magnitude
+								local weight = getTokenPriorityScore(name)
+								if isBuffAwareEnabled then
+									if not buffLogicState.initialized then
+										buffLogicState.initialized = true
+										buffLogicState.activeBuffs = {}
+										buffLogicState.lastScan = 0
+										buffLogicState.scanInterval = 4
+										buffLogicState.modulesLoaded = false
+									end
+									local now_tick = tick()
+									if not buffLogicState.modulesLoaded and (now_tick - buffLogicState.lastScan > buffLogicState.scanInterval) then
+										local ReplicatedStorage = game:GetService("ReplicatedStorage")
+										if ReplicatedStorage then
+											local ok_os, res_os = pcall(require, ReplicatedStorage:WaitForChild("OsTime", 0.5))
+											local ok_buffs, res_buffs = pcall(require, ReplicatedStorage:WaitForChild("Buffs", 0.5))
+											local ok_events, res_events = pcall(require, ReplicatedStorage:WaitForChild("Events", 0.5))
+											if ok_os and ok_buffs and ok_events and res_os and res_buffs and res_events then
+												buffLogicState.OsTime = res_os
+												buffLogicState.BuffsModule = res_buffs
+												buffLogicState.Events = res_events
+												buffLogicState.modulesLoaded = true
+											else
+												buffLogicState.lastScan = now_tick + 30
+											end
+										end
+									end
+									if buffLogicState.modulesLoaded and (now_tick - buffLogicState.lastScan > buffLogicState.scanInterval) then
+										buffLogicState.lastScan = now_tick
+										task.spawn(function()
+											local s, r = pcall(buffLogicState.Events.ClientCall, "RetrievePlayerStats")
+											if s and r then
+												local now_os = buffLogicState.OsTime()
+												local newBuffs = {}
+												if r.Modifiers then
+													for _, v in pairs(r.Modifiers) do
+														for _, d in pairs(v) do
+															if d.Mods then
+																for _, m in ipairs(d.Mods) do
+																	if m.Src then
+																		local def = buffLogicState.BuffsModule.Get(m.Src)
+																		if def then
+																			local dur = m.Dur or def.Dur
+																			if dur then
+																				local st, tl = m.Start, dur
+																				if st and now_os then
+																					tl = dur - (now_os - st)
+																				end
+																				if tl > 0 then
+																					newBuffs[m.Src] = tl
+																				end
+																			end
+																		end
+																	end
+																end
+															end
+														end
+													end
+												end
+												buffLogicState.activeBuffs = newBuffs
+											end
+										end)
+									end
+									if buffLogicState.modulesLoaded then
+										local timeLeft = buffLogicState.activeBuffs[name]
+										if name == "Token Link" then
+											weight = weight * 15
+										elseif timeLeft then
+											if timeLeft < 7 then
+												weight = weight * 3.0
+											else
+												weight = weight * 0.25
+											end
+										else
+											weight = weight * 1.5
+										end
+									end
+								end
+								local score = computeCandidateScore(weight, travelDist, info.SpawnTime or now, now, part.Transparency)
+								addHeatSample(pos, 0.1)
+								table.insert(candidates, {
+									Part = part,
+									Pos = targetPos,
+									RawPos = pos,
+									Dist = travelDist,
+									SpawnTime = info.SpawnTime or now,
+									IsPriority = FARM_PRIORITY_ITEMS[name] == true,
+									TokenName = name,
+									BaseWeight = weight,
+									Score = score,
+								})
+							end
+						end
+					end
+				end
+			end
+		end
+
+		for i, c1 in ipairs(candidates) do
+			local clusterBonus = 0
+			for j, c2 in ipairs(candidates) do
+				if i ~= j then
+					local dist = (c1.RawPos - c2.RawPos).Magnitude
+					local radius = 45
+					if dist < radius then
+						local proximityFactor = (1 - (dist / radius)) ^ 2
+						clusterBonus = clusterBonus + (c2.BaseWeight or 0) * proximityFactor * 0.45
+					end
+				end
+			end
+			c1.Score = (c1.Score or 0) + clusterBonus
+		end
+
+		table.sort(candidates, function(a, b)
+			if math.abs((a.Score or 0) - (b.Score or 0)) > 0.1 then
+				return (a.Score or 0) > (b.Score or 0)
+			end
+			return a.Dist < b.Dist
+		end)
+
+		local topCandidate = candidates[1]
+		if activeToken and not activeTokenIsLink and topCandidate and activeToken ~= topCandidate.Part then
+			local info = tokenMetadata[activeToken]
+			local currentScore = (info and info.LastScore) or activeTokenScore or 0
+			local bestScore = topCandidate.Score or topCandidate.BaseWeight or 0
+			if bestScore - currentScore >= SCORE_RELOCK_THRESHOLD then
+				releaseActiveToken()
+				lockActiveCandidate(topCandidate)
+			end
+		end
+
+		if not activeToken then
+			if topCandidate then
+				lockActiveCandidate(topCandidate)
+			else
+				if (not wanderTarget) or (rootPart.Position - wanderTarget).Magnitude < 10 or now > wanderExpireTime then
+					local wanderBase = rootPart.Position
+					if sproutFarmState == "FarmingSprout" and activeSprout then
+						wanderBase = activeSprout.Position
+					elseif (sproutFarmState == "CollectingRewards" or sproutFarmState == "FarmingSprout") and wanderLastBase then
+						wanderBase = wanderLastBase
+					end
+					wanderTarget = chooseWanderSpot(wanderBase, now)
+					if wanderTarget then
+						wanderExpireTime = now + 2.75
+					end
+				end
+				if not wanderTarget then
+					wanderTarget = rootPart.Position + Vector3.new(math.random(-8, 8), 0, math.random(-8, 8))
+					wanderExpireTime = now + 1.5
+				end
+				requestMoveTo(wanderTarget)
+				currentTargetPosition = wanderTarget
+			end
+		elseif not currentTargetPosition then
+			local info = tokenMetadata[activeToken]
+			if info and info.LastPos then
+				currentTargetPosition = predictTokenPosition(info, rootPart.Position, humanoid.WalkSpeed) or info.LastPos
+			end
+		end
+
+		local pathPoints = {}
+		table.insert(pathPoints, rootPart.Position)
+		if currentTargetPosition then
+			table.insert(pathPoints, currentTargetPosition)
+		end
+		local lastPoint = pathPoints[#pathPoints]
+		if #candidates > 0 and lastPoint then
+			local maxExtra = MAX_PATH_SEGMENTS - 1
+			for i = 1, math.min(#candidates, maxExtra) do
+				local pos = candidates[i].Pos
+				if (pos - lastPoint).Magnitude > 1 then
+					table.insert(pathPoints, pos)
+					lastPoint = pos
+				end
+			end
+		end
+
+		local segmentCount = #pathPoints - 1
+		for i = 1, #pathParts do
+			local part = pathParts[i]
+			if i <= segmentCount then
+				local startPos = pathPoints[i]
+				local endPos = pathPoints[i + 1]
+				local direction = endPos - startPos
+				local distance = direction.Magnitude
+				if distance > 1 then
+					part.Transparency = 0.25
+					part.Size = Vector3.new(0.15, 0.15, distance)
+					part.CFrame = CFrame.new(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
+				else
+					part.Transparency = 1
+				end
+			else
+				part.Transparency = 1
+			end
+		end
+	end
 end)
 local function onCharacterAdded(character)
-local humanoid = character:WaitForChild("Humanoid")
-defaultWalkSpeed, defaultJumpPower = humanoid.WalkSpeed, humanoid.JumpPower
+	local humanoid = character:WaitForChild("Humanoid")
+	defaultWalkSpeed, defaultJumpPower = humanoid.WalkSpeed, humanoid.JumpPower
 end
 LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
-if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
+if LocalPlayer.Character then
+	onCharacterAdded(LocalPlayer.Character)
+end
