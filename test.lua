@@ -19,65 +19,53 @@ local lastMoveCommandTime = 0
 local hasTaskCancel = (type(task) == "table" or type(task) == "userdata")
 and type(task.cancel) == "function"
 local function notify(title, text, duration)
-pcall(function()
-Library:Notify({
-Title = title or "Notice",
-Text = text or "",
-Duration = duration or 3,
-Type = "Info",
-})
-end)
+    pcall(function()
+        Library:Notify({
+        Title = title or "Notice",
+        Text = text or "",
+        Duration = duration or 3,
+        Type = "Info",
+        })
+    end)
 end
 local function resetTable(tbl)
-if type(tbl) ~= "table" then
-return
-end
-if table.clear then
-table.clear(tbl)
-return
-end
-for key in pairs(tbl) do
-tbl[key] = nil
-end
+    if type(tbl) ~= "table" then
+        return
+    end
+    if table.clear then
+        table.clear(tbl)
+    return
+    end
+    for key in pairs(tbl) do
+        tbl[key] = nil
+    end
 end
 local function resetMoveCommand()
-lastMoveCommandPos = nil
-lastMoveCommandTime = 0
+    lastMoveCommandPos = nil
+    lastMoveCommandTime = 0
 end
 local function getHumanoid()
-local character = LocalPlayer.Character
-return character and character:FindFirstChildOfClass("Humanoid")
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChildOfClass("Humanoid")
 end
 local function getHRP()
-local character = LocalPlayer.Character
-return character and character:FindFirstChild("HumanoidRootPart")
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
 end
 local function hardTeleportTo(cf)
-local character = LocalPlayer.Character
-local hrp = getHRP()
-if not character or not hrp or typeof(cf) ~= "CFrame" then
-return
+    local character = LocalPlayer.Character
+    local hrp = getHRP()
+    if not character or not hrp or typeof(cf) ~= "CFrame" then return end 
+    character:PivotTo(cf)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+end
+local function requestMoveTo(pos, bool)
+    local character = LocalPlayer.Character
+    local hrp = getHRP()
+    if not character or not hrp or typeof(cf) ~= "CFrame" then return end
+    character.Humanoid:MoveTo(pos)
 end
 
-local originalAnchored = hrp.Anchored
-local humanoid = character:FindFirstChildOfClass("Humanoid")
-pcall(function()
-    if humanoid then
-        humanoid.AutoRotate = false
-    end
-    hrp.AssemblyLinearVelocity = Vector3.new()
-    hrp.AssemblyAngularVelocity = Vector3.new()
-    hrp.Anchored = true
-    character:PivotTo(cf)
-    task.wait(0.1)
-end)
-pcall(function()
-    hrp.Anchored = originalAnchored
-    if humanoid then
-        humanoid.AutoRotate = true
-    end
-end)
-end
 local function formatShort(num)
 num = tonumber(num) or 0
 local abs = math.abs(num)
@@ -119,12 +107,6 @@ local isSpeedEnabled = false
 local isJumpEnabled = false
 local isNoclipEnabled = false
 local isAutoFarmEnabled = false
-local isSproutFarmingEnabled = false
-local isActivelyFarmingSprout = false
-local activeSproutTarget = nil
-local originalSelectedField = nil
-local originalSelectedFieldName = nil
-local sproutLootCollectionEndTime = nil
 local isAutoDispenseEnabled = false
 local antiAfkEnabled = false
 local antiAfkConnection = nil
@@ -2223,23 +2205,6 @@ refreshFieldBounds()
 end
 })
 AutoFarmSection:CreateToggle({
-    Title = "Sprout Farming",
-    Default = false,
-    SaveKey = "farm_sprout_farming_enabled",
-    HelpText = "Automatically detects and moves to farm sprouts, then returns to your selected field.",
-    Callback = function(state)
-        isSproutFarmingEnabled = state
-        if not state then
-            -- If disabled mid-process, reset everything to be safe
-            isActivelyFarmingSprout = false
-            activeSproutTarget = nil
-            originalSelectedField = nil
-            originalSelectedFieldName = nil
-            sproutLootCollectionEndTime = nil
-        end
-    end
-})
-AutoFarmSection:CreateToggle({
 Title = "Auto Dispense Honey",
 Default = true,
 SaveKey = "farm_auto_dispense",
@@ -2872,95 +2837,6 @@ if not isAutoFarmEnabled or isDispensing then
     end
     return
 end
-
--- =============================================================
--- SPROUT FARMING LOGIC
--- =============================================================
-if isSproutFarmingEnabled then
-    local sproutsFolder = Workspace:FindFirstChild("Sprouts")
-
-    -- Phase 3: Loot Collection & Return
-    if sproutLootCollectionEndTime and now > sproutLootCollectionEndTime then
-        notify("Sprout Farm", "Loot collection finished. Returning.", 3)
-        sproutLootCollectionEndTime = nil
-        isActivelyFarmingSprout = false
-        if originalSelectedField and originalSelectedField.Parent then
-            selectedField = originalSelectedField
-            selectedFieldName = originalSelectedFieldName
-            currentFieldHeat = getFieldHeatTable(selectedFieldName)
-            refreshFieldBounds()
-            resetMoveCommand()
-            hardTeleportTo(selectedField.CFrame + Vector3.new(0, 5, 0))
-            notify("Sprout Farm", "Returned to " .. selectedFieldName, 4)
-        end
-        originalSelectedField = nil
-        originalSelectedFieldName = nil
-    end
-
-    -- Phase 2: Check on the active sprout
-    if isActivelyFarmingSprout then
-        if not activeSproutTarget or not activeSproutTarget.Parent then
-            if activeSproutTarget then 
-                notify("Sprout Farm", "Sprout destroyed! Collecting rewards for 15s.", 4)
-                sproutLootCollectionEndTime = now + 15
-            end
-            activeSproutTarget = nil
-        end
-    end
-    
-    -- Phase 1: Detection & Override
-    if sproutsFolder and not isActivelyFarmingSprout and not sproutLootCollectionEndTime then
-        local foundSprout = nil
-        for _, sprout in ipairs(sproutsFolder:GetChildren()) do
-            if sprout.Name == "Sprout" and sprout:FindFirstChild("Health") then
-                foundSprout = sprout
-                break
-            end
-        end
-
-        if foundSprout then
-            local sproutPart = foundSprout.PrimaryPart or foundSprout:FindFirstChildWhichIsA("BasePart")
-            if sproutPart then
-                local sproutPos = sproutPart.Position
-                
-                local closestField, closestFieldName, minDistance = nil, nil, math.huge
-                for name, fieldPart in pairs(fieldObjects) do
-                    local dist = (sproutPos - fieldPart.Position).Magnitude
-                    if dist < minDistance then
-                        minDistance = dist
-                        closestField = fieldPart
-                        closestFieldName = name
-                    end
-                end
-
-                if closestField and closestFieldName ~= selectedFieldName then
-                    notify("Sprout Farm", "Sprout found in " .. closestFieldName .. "! Moving to farm.", 5)
-                    
-                    originalSelectedField = selectedField
-                    originalSelectedFieldName = selectedFieldName
-
-                    selectedField = closestField
-                    selectedFieldName = closestFieldName
-                    currentFieldHeat = getFieldHeatTable(closestFieldName)
-                    refreshFieldBounds()
-                    resetMoveCommand()
-
-                    hardTeleportTo(selectedField.CFrame + Vector3.new(0, 5, 0))
-                    activeSproutTarget = foundSprout
-                    isActivelyFarmingSprout = true
-                elseif closestField and closestFieldName == selectedFieldName then
-                    notify("Sprout Farm", "Sprout found in current field!", 3)
-                    activeSproutTarget = foundSprout
-                    isActivelyFarmingSprout = true
-                end
-            end
-        end
-    end
-end
--- =============================================================
--- END OF SPROUT LOGIC
--- =============================================================
-
 -- Simplified stuck logic: if wandering and not moving, find a new spot.
 if not activeToken and wanderTarget and now - lastMoveCommandTime > 4 then
     wanderTarget = chooseWanderSpot(rootPart.Position, now)
