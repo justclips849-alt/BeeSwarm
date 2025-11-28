@@ -119,14 +119,12 @@ local isSpeedEnabled = false
 local isJumpEnabled = false
 local isNoclipEnabled = false
 local isAutoFarmEnabled = false
--- Sprout Farm Variables
-local isSproutFarmEnabled = false
-local currentSprout = nil
-local sproutFarmState = "SEARCHING" -- SEARCHING, FARMING, COLLECTING
-local sproutCollectEndTime = 0
-local savedFarmField = nil
-local sproutSearchDelay = 0
-
+local isSproutFarmingEnabled = false
+local isActivelyFarmingSprout = false
+local activeSproutTarget = nil
+local originalSelectedField = nil
+local originalSelectedFieldName = nil
+local sproutLootCollectionEndTime = nil
 local isAutoDispenseEnabled = false
 local antiAfkEnabled = false
 local antiAfkConnection = nil
@@ -540,14 +538,18 @@ return TOKEN_PRIORITY_WEIGHT[name] or 12
 end
 local function computeCandidateScore(baseWeight, travelDist, spawnTime, now, transparency)
     local age = math.max(now - (spawnTime or now), 0)
+    -- More points for older tokens that are about to despawn.
     local ageBonus = math.min(age * 3, 25)
+    -- Bonus for transparency, also indicating it is about to despawn.
     local transparency = transparency or 0
-    local transparencyBonus = transparency ^ 2 * 40 
+    local transparencyBonus = transparency ^ 2 * 40 -- Slightly increased base bonus
     
+    -- Add a large "emergency" bonus for tokens that are critically close to despawning.
     if transparency > 0.85 then
         transparencyBonus = transparencyBonus + 50
     end
 
+    -- Distance penalty is more significant for further tokens.
     local distancePenalty = travelDist / 3.5
     local score = baseWeight + ageBonus + transparencyBonus - distancePenalty
     return score
@@ -1828,35 +1830,6 @@ fieldObjects[part.Name] = part
 end
 end
 table.sort(fieldNames)
--- [[ Sprout Helper Functions ]] --
-local function getFieldFromPosition(pos)
-    for name, part in pairs(fieldObjects) do
-        local size = part.Size
-        local cf = part.CFrame
-        local rel = cf:PointToObjectSpace(pos)
-        if math.abs(rel.X) <= size.X/2 and math.abs(rel.Z) <= size.Z/2 then
-            return part, name
-        end
-    end
-    return nil, nil
-end
-
-local function findSprout()
-    local sprouts = Workspace:FindFirstChild("Sprouts")
-    if not sprouts then return nil, nil end
-    
-    for _, child in ipairs(sprouts:GetChildren()) do
-        if child:IsA("Model") or child:IsA("BasePart") then
-            local pos = child:GetPivot().Position
-            local fieldPart, fieldName = getFieldFromPosition(pos)
-            if fieldPart then
-                return child, fieldName
-            end
-        end
-    end
-    return nil, nil
-end
-
 local fieldRoute = {}
 local fieldRouteThread = nil
 local fieldRouteEnabled = false
@@ -2250,22 +2223,19 @@ refreshFieldBounds()
 end
 })
 AutoFarmSection:CreateToggle({
-    Title = "Auto Farm Sprouts",
+    Title = "Sprout Farming",
     Default = false,
-    SaveKey = "farm_sprouts_enabled",
+    SaveKey = "farm_sprout_farming_enabled",
+    HelpText = "Automatically detects and moves to farm sprouts, then returns to your selected field.",
     Callback = function(state)
-        isSproutFarmEnabled = state
+        isSproutFarmingEnabled = state
         if not state then
-            -- Reset state if disabled
-            currentSprout = nil
-            sproutFarmState = "SEARCHING"
-            if savedFarmField and selectedFieldName ~= savedFarmField then
-                -- Return to original field immediately
-                if uiObjects.farmFieldDropdown then
-                    uiObjects.farmFieldDropdown:SetSelection(savedFarmField)
-                end
-            end
-            savedFarmField = nil
+            -- If disabled mid-process, reset everything to be safe
+            isActivelyFarmingSprout = false
+            activeSproutTarget = nil
+            originalSelectedField = nil
+            originalSelectedFieldName = nil
+            sproutLootCollectionEndTime = nil
         end
     end
 })
@@ -2886,52 +2856,6 @@ local humanoid = char.Humanoid
 local rootPart = char.HumanoidRootPart
 
 local now = tick()
--- [[ SPROUT FARMING LOGIC ]] --
-if isSproutFarmEnabled and isAutoFarmEnabled then
-    if sproutFarmState == "SEARCHING" then
-        if now > sproutSearchDelay then
-            local sprout, fieldName = findSprout()
-            if sprout and fieldName then
-                if selectedFieldName and selectedFieldName ~= fieldName then
-                    savedFarmField = selectedFieldName
-                end
-                
-                currentSprout = sprout
-                sproutFarmState = "FARMING"
-                
-                selectedField = fieldObjects[fieldName]
-                selectedFieldName = fieldName
-                currentFieldHeat = getFieldHeatTable(fieldName)
-                
-                notify("Sprout Farm", "Sprout detected at " .. fieldName, 3)
-                hardTeleportTo(selectedField.CFrame + Vector3.new(0, 5, 0))
-            end
-            sproutSearchDelay = now + 2 
-        end
-        
-    elseif sproutFarmState == "FARMING" then
-        if not currentSprout or not currentSprout.Parent then
-            notify("Sprout Farm", "Sprout broken! Collecting loot...", 3)
-            sproutFarmState = "COLLECTING"
-            sproutCollectEndTime = now + 15
-        end
-        
-    elseif sproutFarmState == "COLLECTING" then
-        if now > sproutCollectEndTime then
-            notify("Sprout Farm", "Collection finished. Returning.", 3)
-            currentSprout = nil
-            sproutFarmState = "SEARCHING"
-            
-            if savedFarmField then
-                selectedField = fieldObjects[savedFarmField]
-                selectedFieldName = savedFarmField
-                currentFieldHeat = getFieldHeatTable(savedFarmField)
-                hardTeleportTo(selectedField.CFrame + Vector3.new(0, 5, 0))
-            end
-        end
-    end
-end
--- [[ END SPROUT FARMING LOGIC ]] --
 local currentTargetPosition = nil
 local candidates = candidateBuffer
 if isSpeedEnabled and not isDispensing then humanoid.WalkSpeed = currentSpeed end
@@ -2948,6 +2872,95 @@ if not isAutoFarmEnabled or isDispensing then
     end
     return
 end
+
+-- =============================================================
+-- SPROUT FARMING LOGIC
+-- =============================================================
+if isSproutFarmingEnabled then
+    local sproutsFolder = Workspace:FindFirstChild("Sprouts")
+
+    -- Phase 3: Loot Collection & Return
+    if sproutLootCollectionEndTime and now > sproutLootCollectionEndTime then
+        notify("Sprout Farm", "Loot collection finished. Returning.", 3)
+        sproutLootCollectionEndTime = nil
+        isActivelyFarmingSprout = false
+        if originalSelectedField and originalSelectedField.Parent then
+            selectedField = originalSelectedField
+            selectedFieldName = originalSelectedFieldName
+            currentFieldHeat = getFieldHeatTable(selectedFieldName)
+            refreshFieldBounds()
+            resetMoveCommand()
+            hardTeleportTo(selectedField.CFrame + Vector3.new(0, 5, 0))
+            notify("Sprout Farm", "Returned to " .. selectedFieldName, 4)
+        end
+        originalSelectedField = nil
+        originalSelectedFieldName = nil
+    end
+
+    -- Phase 2: Check on the active sprout
+    if isActivelyFarmingSprout then
+        if not activeSproutTarget or not activeSproutTarget.Parent then
+            if activeSproutTarget then 
+                notify("Sprout Farm", "Sprout destroyed! Collecting rewards for 15s.", 4)
+                sproutLootCollectionEndTime = now + 15
+            end
+            activeSproutTarget = nil
+        end
+    end
+    
+    -- Phase 1: Detection & Override
+    if sproutsFolder and not isActivelyFarmingSprout and not sproutLootCollectionEndTime then
+        local foundSprout = nil
+        for _, sprout in ipairs(sproutsFolder:GetChildren()) do
+            if sprout.Name == "Sprout" and sprout:FindFirstChild("Health") then
+                foundSprout = sprout
+                break
+            end
+        end
+
+        if foundSprout then
+            local sproutPart = foundSprout.PrimaryPart or foundSprout:FindFirstChildWhichIsA("BasePart")
+            if sproutPart then
+                local sproutPos = sproutPart.Position
+                
+                local closestField, closestFieldName, minDistance = nil, nil, math.huge
+                for name, fieldPart in pairs(fieldObjects) do
+                    local dist = (sproutPos - fieldPart.Position).Magnitude
+                    if dist < minDistance then
+                        minDistance = dist
+                        closestField = fieldPart
+                        closestFieldName = name
+                    end
+                end
+
+                if closestField and closestFieldName ~= selectedFieldName then
+                    notify("Sprout Farm", "Sprout found in " .. closestFieldName .. "! Moving to farm.", 5)
+                    
+                    originalSelectedField = selectedField
+                    originalSelectedFieldName = selectedFieldName
+
+                    selectedField = closestField
+                    selectedFieldName = closestFieldName
+                    currentFieldHeat = getFieldHeatTable(closestFieldName)
+                    refreshFieldBounds()
+                    resetMoveCommand()
+
+                    hardTeleportTo(selectedField.CFrame + Vector3.new(0, 5, 0))
+                    activeSproutTarget = foundSprout
+                    isActivelyFarmingSprout = true
+                elseif closestField and closestFieldName == selectedFieldName then
+                    notify("Sprout Farm", "Sprout found in current field!", 3)
+                    activeSproutTarget = foundSprout
+                    isActivelyFarmingSprout = true
+                end
+            end
+        end
+    end
+end
+-- =============================================================
+-- END OF SPROUT LOGIC
+-- =============================================================
+
 -- Simplified stuck logic: if wandering and not moving, find a new spot.
 if not activeToken and wanderTarget and now - lastMoveCommandTime > 4 then
     wanderTarget = chooseWanderSpot(rootPart.Position, now)
@@ -3115,16 +3128,18 @@ for _, part in ipairs(collectibles:GetChildren()) do
                     local travelDist = (rootPart.Position - targetPos).Magnitude
                     local weight = getTokenPriorityScore(name)
                     if isBuffAwareEnabled then
+                        -- Safely initialize state on first run
                         if not buffLogicState.initialized then
                             buffLogicState.initialized = true
                             buffLogicState.activeBuffs = {}
                             buffLogicState.lastScan = 0
-                            buffLogicState.scanInterval = 4 
+                            buffLogicState.scanInterval = 4 -- Scan slightly more often
                             buffLogicState.modulesLoaded = false
                         end
                         
                         local now_tick = tick()
                         
+                        -- Attempt to load modules if not already loaded
                         if not buffLogicState.modulesLoaded and (now_tick - buffLogicState.lastScan > buffLogicState.scanInterval) then
                             local ReplicatedStorage = game:GetService("ReplicatedStorage")
                             if ReplicatedStorage then
@@ -3142,13 +3157,14 @@ for _, part in ipairs(collectibles:GetChildren()) do
                             end
                         end
                         
+                        -- Periodically scan for buffs
                         if buffLogicState.modulesLoaded and (now_tick - buffLogicState.lastScan > buffLogicState.scanInterval) then
                             buffLogicState.lastScan = now_tick
                             task.spawn(function()
                                 local s, r = pcall(buffLogicState.Events.ClientCall, "RetrievePlayerStats")
                                 if s and r then
                                     local now_os = buffLogicState.OsTime()
-                                    local newBuffs = {} 
+                                    local newBuffs = {} -- Scan into a temp table to prevent race conditions
                                     if r.Modifiers then
                                         for _, v in pairs(r.Modifiers) do for _, d in pairs(v) do if d.Mods then for _, m in ipairs(d.Mods) do if m.Src then
                                             local def = buffLogicState.BuffsModule.Get(m.Src)
@@ -3157,28 +3173,34 @@ for _, part in ipairs(collectibles:GetChildren()) do
                                                 if dur then
                                                     local st, tl = m.Start, dur
                                                     if st and now_os then tl = dur - (now_os - st) end
-                                                    if tl > 0 then newBuffs[m.Src] = tl end 
+                                                    if tl > 0 then newBuffs[m.Src] = tl end -- Store time left
                                                 end
                                             end
                                         end end end end end
                                     end
+                                    -- Atomically update the buffs table for the main thread
                                     buffLogicState.activeBuffs = newBuffs
                                 end
                             end)
                         end
 
+                        -- Apply smarter dynamic weight if modules are loaded
                         if buffLogicState.modulesLoaded then
                             local timeLeft = buffLogicState.activeBuffs[name]
 
                             if name == "Token Link" then
-                                weight = weight * 15 
+                                weight = weight * 15 -- Overwhelming priority
                             elseif timeLeft then
+                                -- Buff is active, check if it's expiring
                                 if timeLeft < 7 then
+                                    -- High priority to refresh
                                     weight = weight * 3.0
                                 else
+                                    -- Buff is healthy, low priority
                                     weight = weight * 0.25
                                 end
                             else
+                                -- Buff is not active, medium priority to acquire
                                 weight = weight * 1.5
                             end
                         end
@@ -3201,15 +3223,17 @@ for _, part in ipairs(collectibles:GetChildren()) do
         end
     end
 end
+-- Boost scores based on token density to favor clusters
 for i, c1 in ipairs(candidates) do
     local clusterBonus = 0
     for j, c2 in ipairs(candidates) do
         if i ~= j then
             local dist = (c1.RawPos - c2.RawPos).Magnitude
-            local radius = 45 
+            local radius = 45 -- Studs
             if dist < radius then
-                local proximityFactor = (1 - (dist / radius))^2
-                clusterBonus = clusterBonus + (c2.BaseWeight or 0) * proximityFactor * 0.45 
+                -- Bonus is proportional to neighbor's base value and proximity
+                local proximityFactor = (1 - (dist / radius))^2 -- squared for stronger falloff
+                clusterBonus = clusterBonus + (c2.BaseWeight or 0) * proximityFactor * 0.45 -- 45% cluster effect
             end
         end
     end
@@ -3217,9 +3241,11 @@ for i, c1 in ipairs(candidates) do
 end
 
 table.sort(candidates, function(a, b)
+    -- Primarily sort by score
     if math.abs((a.Score or 0) - (b.Score or 0)) > 0.1 then
         return (a.Score or 0) > (b.Score or 0)
     end
+    -- As a final tie-breaker, take the closer one
     return a.Dist < b.Dist
 end)
 local topCandidate = candidates[1]
